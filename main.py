@@ -234,5 +234,18 @@ def update_order_status(order_id: str, payload: OrderStatusUpdate):
     }
 
 
+# Order lifecycle rules.
+# This prevents illegal state changes and enforces business logic consistency.
+# Any new status MUST be added here intentionally.
+
+PENDING      # created, unpaid
+CONFIRMED    # paid by customer
+ASSIGNED     # driver assigned
+PICKED_UP
+DELIVERED
+CANCELLED
+
+
+
 
 
