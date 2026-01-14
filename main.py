@@ -394,7 +394,10 @@ def set_driver_availability(driver_id: str, payload: SetDriverAvailabilityReques
 
 
 @app.post("/orders/{order_id}/assign-driver")
-def assign_driver(order_id: str, payload: AssignDriverRequest):
+def assign_driver(
+    order_id: str,
+    payload: Optional[AssignDriverRequest] = Body(default=None)
+):
     """
     Assign a driver to a CONFIRMED order.
 
@@ -415,21 +418,30 @@ def assign_driver(order_id: str, payload: AssignDriverRequest):
             detail=f"Order must be confirmed before assignment. Current: {order['status']}"
         )
 
-    # Prevent reassignment unless you explicitly build reassignment rules later
+    # Prevent reassignment
     if order.get("driver_id"):
         raise HTTPException(status_code=409, detail="Order already has a driver assigned")
 
+    # ----------------------------
     # Select driver (manual or auto)
-    if payload.driver_id:
-        driver = DRIVERS_DB.get(payload.driver_id)
+    # ----------------------------
+    if payload and payload.driver_id:
+        driver_id = payload.driver_id.strip()
+        if not driver_id:
+            raise HTTPException(status_code=400, detail="driver_id cannot be empty")
+
+        driver = DRIVERS_DB.get(driver_id)
         if not driver:
             raise HTTPException(status_code=404, detail="Driver not found")
-        if driver.get("is_available") is not True or driver.get("current_order_id") is not None:
+
+        if not driver.get("is_available") or driver.get("current_order_id"):
             raise HTTPException(status_code=409, detail="Driver is not available")
     else:
         driver = pick_available_driver()
 
-    # Lock payouts at assignment time (prevents later manipulation)
+    # ----------------------------
+    # Lock payouts at assignment time
+    # ----------------------------
     driver_payout = order["quote"]["payouts"]["driver_base"]
     platform_payout = order["quote"]["payouts"]["platform_net"]
 
@@ -460,6 +472,7 @@ def assign_driver(order_id: str, payload: AssignDriverRequest):
         },
         "status_timestamps": order.get("status_timestamps", {})
     }
+
 
 
 # ============================================================
