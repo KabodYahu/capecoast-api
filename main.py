@@ -173,3 +173,66 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8080))
     )
+
+
+
+
+# =========================
+# Order State Machine
+# =========================
+
+ALLOWED_TRANSITIONS = {
+    "pending": ["accepted", "cancelled"],
+    "accepted": ["picked_up", "cancelled"],
+    "picked_up": ["en_route"],
+    "en_route": ["delivered"],
+    "delivered": [],
+    "cancelled": []
+}
+
+
+class OrderStatusUpdate(BaseModel):
+    new_status: str
+
+
+@app.patch("/orders/{order_id}/status")
+def update_order_status(order_id: str, payload: OrderStatusUpdate):
+    """
+    Safely move an order through its lifecycle.
+    Prevents illegal jumps (e.g. pending → delivered).
+    """
+
+    order = ORDERS_DB.get(order_id)
+
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    current_status = order["status"]
+    requested_status = payload.new_status
+
+    # Validate transition
+    allowed = ALLOWED_TRANSITIONS.get(current_status, [])
+
+    if requested_status not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid transition: {current_status} → {requested_status}"
+        )
+
+    # Apply transition
+    order["status"] = requested_status
+
+    # Track timestamps per stage
+    order.setdefault("status_timestamps", {})
+    order["status_timestamps"][requested_status] = int(time.time())
+
+    return {
+        "order_id": order_id,
+        "old_status": current_status,
+        "new_status": requested_status,
+        "status_timestamps": order["status_timestamps"]
+    }
+
+
+
+
