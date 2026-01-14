@@ -1,88 +1,171 @@
+# =========================
+# Imports
+# =========================
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from typing import Dict
+from uuid import uuid4
 import time
 import os
 
+# =========================
+# App Initialization
+# =========================
+
 app = FastAPI(title="Cape Coast Delivery API")
 
-# -------------------------
-# CONFIG (CHANGE LATER, NOT LOGIC)
-# -------------------------
-PLATFORM_SHARE = 0.60
-DRIVER_SHARE = 0.40
+# =========================
+# Temporary In-Memory Database
+# (Later: Firestore / Postgres)
+# =========================
 
-# -------------------------
-# REQUEST MODELS
-# -------------------------
-class OrderQuoteRequest(BaseModel):
-    food_subtotal: float = Field(..., gt=0, description="Total food price (restaurant keeps 100%)")
-    platform_fee: float = Field(..., ge=0, description="Flat platform fee")
-    delivery_fee: float = Field(..., ge=0, description="Flat delivery fee")
+# Key = order_id
+# Value = full order record
+ORDERS_DB: Dict[str, dict] = {}
 
-# -------------------------
-# RESPONSE MODELS
-# -------------------------
-class OrderQuoteResponse(BaseModel):
-    food_subtotal: float
-    fees: dict
-    margin_pool: float
-    payouts: dict
-    customer_total: float
-    valid: bool
-    timestamp: int
+# =========================
+# Economic / Pricing Logic
+# (SINGLE SOURCE OF TRUTH)
+# =========================
 
-# -------------------------
-# HEALTH & ROOT
-# -------------------------
-@app.get("/")
-def root():
-    return {"message": "Cape Coast API running"}
+def calculate_quote(food_subtotal: float, platform_fee: float, delivery_fee: float):
+    """
+    Core economic logic.
+    This function is reused everywhere to prevent inconsistencies.
 
-@app.get("/health")
-def health():
-    return {"ok": True, "timestamp": int(time.time())}
+    60% → platform
+    40% → driver
+    """
 
-# -------------------------
-# PRICING ENGINE
-# -------------------------
-@app.post("/orders/quote", response_model=OrderQuoteResponse)
-def quote_order(data: OrderQuoteRequest):
-    # Margin pool excludes food and tips
-    margin_pool = round(data.platform_fee + data.delivery_fee, 2)
+    margin_pool = platform_fee + delivery_fee
 
-    if margin_pool <= 0:
-        raise HTTPException(status_code=400, detail="Invalid margin pool")
+    platform_net = round(margin_pool * 0.60, 2)
+    driver_base = round(margin_pool * 0.40, 2)
 
-    # Split margin
-    platform_net = round(margin_pool * PLATFORM_SHARE, 2)
-    driver_base = round(margin_pool * DRIVER_SHARE, 2)
-
-    # Safety check (floating point edge cases)
-    if round(platform_net + driver_base, 2) != margin_pool:
-        driver_base = round(margin_pool - platform_net, 2)
-
-    customer_total = round(data.food_subtotal + margin_pool, 2)
+    customer_total = round(food_subtotal + margin_pool, 2)
 
     return {
-        "food_subtotal": data.food_subtotal,
+        "food_subtotal": food_subtotal,
         "fees": {
-            "platform_fee": data.platform_fee,
-            "delivery_fee": data.delivery_fee
+            "platform_fee": platform_fee,
+            "delivery_fee": delivery_fee
         },
         "margin_pool": margin_pool,
         "payouts": {
-            "restaurant": data.food_subtotal,
+            "restaurant": food_subtotal,
             "platform_net": platform_net,
             "driver_base": driver_base
         },
         "customer_total": customer_total,
-        "valid": True,
-        "timestamp": int(time.time())
+        "valid": True
     }
 
+# =========================
+# Request / Response Models
+# =========================
+
+class OrderQuoteRequest(BaseModel):
+    food_subtotal: float = Field(gt=0)
+    platform_fee: float = Field(ge=0)
+    delivery_fee: float = Field(ge=0)
+
+
+class CreateOrderRequest(OrderQuoteRequest):
+    """
+    Extends the quote request.
+    Adds restaurant identity so we can persist the order.
+    """
+    restaurant_id: str
+
+
+class OrderResponse(BaseModel):
+    order_id: str
+    restaurant_id: str
+    status: str
+    quote: dict
+    created_at: int
+
+# =========================
+# API Endpoints
+# =========================
+
+@app.get("/")
+def root():
+    """Health / sanity check"""
+    return {"message": "Cape Coast API running"}
+
 # -------------------------
-# CLOUD RUN ENTRYPOINT
+# 1️⃣ Quote Only (NO STORAGE)
 # -------------------------
+
+@app.post("/orders/quote")
+def quote_order(payload: OrderQuoteRequest):
+    """
+    Returns pricing ONLY.
+    No order is created.
+    Used for previews in the app.
+    """
+    return calculate_quote(
+        payload.food_subtotal,
+        payload.platform_fee,
+        payload.delivery_fee
+    )
+
+# -------------------------
+# 2️⃣ Create Order (PERSIST)
+# -------------------------
+
+@app.post("/orders", response_model=OrderResponse)
+def create_order(payload: CreateOrderRequest):
+    """
+    Creates and stores an order.
+    Locks in the economics.
+    """
+
+    quote = calculate_quote(
+        payload.food_subtotal,
+        payload.platform_fee,
+        payload.delivery_fee
+    )
+
+    order_id = f"ORD-{uuid4().hex[:10].upper()}"
+    timestamp = int(time.time())
+
+    order_record = {
+        "order_id": order_id,
+        "restaurant_id": payload.restaurant_id,
+        "status": "pending",  # lifecycle starts here
+        "quote": quote,
+        "created_at": timestamp
+    }
+
+    ORDERS_DB[order_id] = order_record
+
+    return order_record
+
+# -------------------------
+# 3️⃣ Retrieve Order
+# -------------------------
+
+@app.get("/orders/{order_id}")
+def get_order(order_id: str):
+    """
+    Fetch a persisted order.
+    Used by customers, drivers, admins.
+    """
+
+    order = ORDERS_DB.get(order_id)
+
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    return order
+
+# =========================
+# Cloud Run Entrypoint
+# =========================
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
