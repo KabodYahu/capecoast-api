@@ -546,93 +546,221 @@ def assign_driver(
 
 
 # ============================================================
-# 7) Complete Delivery
+# 7A) DRIVER CONFIRMS PICKUP (PHOTO REQUIRED)
 # ============================================================
 
-@app.post("/orders/{order_id}/complete")
-def complete_delivery(order_id: str):
+class PickupRequest(BaseModel):
     """
-    Marks an order as delivered and releases the driver.
+    Driver must upload a photo of the picked-up items.
+    Pickup CANNOT be confirmed without this.
+    """
+    pickup_photo_url: str = Field(min_length=10)
+
+
+@app.post("/orders/{order_id}/pickup")
+def confirm_pickup(order_id: str, payload: PickupRequest):
+    """
+    Driver confirms pickup at restaurant/store.
 
     RULES:
-    - Order must be in 'en_route' status
-    - Order must have a driver assigned
-    - Driver is freed and becomes available again
-    - Payouts are finalized (already locked earlier)
+    - Order must be ASSIGNED
+    - Pickup photo is mandatory
     """
 
-    # --------------------------------------------------------
-    # Lookup order
-    # --------------------------------------------------------
     order = ORDERS_DB.get(order_id)
-
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # --------------------------------------------------------
-    # Validate order state
-    # --------------------------------------------------------
-    if order["status"] != "en_route":
+    if order["status"] != "assigned":
         raise HTTPException(
             status_code=400,
-            detail=f"Order must be en_route to complete. Current: {order['status']}",
+            detail=f"Pickup not allowed in state: {order['status']}",
         )
 
-    if not order.get("driver_id"):
-        raise HTTPException(
-            status_code=500,
-            detail="Order has no assigned driver (data integrity error)",
-        )
+    # ---- Record pickup proof ----
+    order["pickup_photo_url"] = payload.pickup_photo_url
+    order["pickup_confirmed_at"] = now_ts()
 
-    # --------------------------------------------------------
-    # Lookup driver
-    # --------------------------------------------------------
-    driver = DRIVERS_DB.get(order["driver_id"])
+    # ---- Transition lifecycle ----
+    safe_transition(order, "picked_up")
 
-    if not driver:
-        raise HTTPException(
-            status_code=500,
-            detail="Assigned driver record missing (data integrity error)",
-        )
-
-    if driver.get("current_order_id") != order_id:
-        raise HTTPException(
-            status_code=409,
-            detail="Driver is not assigned to this order",
-        )
-
-    # --------------------------------------------------------
-    # Transition order → delivered
-    # --------------------------------------------------------
-    safe_transition(order, "delivered")
-
-    # --------------------------------------------------------
-    # Release driver
-    # --------------------------------------------------------
-    driver["current_order_id"] = None
-    driver["is_available"] = True
-
-    driver.setdefault("status_timestamps", {})
-    driver["status_timestamps"]["available"] = now_ts()
-
-    # --------------------------------------------------------
-    # Final response
-    # --------------------------------------------------------
     return {
         "order_id": order_id,
         "status": order["status"],
-        "delivered_at": order["status_timestamps"]["delivered"],
-        "driver": {
-            "driver_id": driver["driver_id"],
-            "name": driver["name"],
-            "phone": driver["phone"],
-            "is_available": driver["is_available"],
-        },
+        "pickup_time": order["pickup_confirmed_at"],
+        "message": "Pickup confirmed. Great work 🚀",
+    }
+
+
+# ============================================================
+# 7B) START DELIVERY (BEGIN TIMER + GPS)
+# ============================================================
+
+@app.post("/orders/{order_id}/start-delivery")
+def start_delivery(order_id: str):
+    """
+    Driver begins delivery after pickup.
+
+    RULES:
+    - Order must be PICKED_UP
+    - Starts delivery timer
+    - Enables GPS routing on frontend
+    """
+
+    order = ORDERS_DB.get(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order["status"] != "picked_up":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot start delivery from state: {order['status']}",
+        )
+
+    order["delivery_started_at"] = now_ts()
+
+    safe_transition(order, "en_route")
+
+    return {
+        "order_id": order_id,
+        "status": order["status"],
+        "delivery_started_at": order["delivery_started_at"],
+        "message": "Delivery started. Drive safe 🛣️",
+    }
+
+
+# ============================================================
+# 7C) ARRIVAL DETECTED (GPS / SYSTEM EVENT)
+# ============================================================
+
+@app.post("/orders/{order_id}/arrived")
+def mark_arrival(order_id: str):
+    """
+    System marks arrival at destination based on GPS proximity.
+
+    RULES:
+    - Order must be EN_ROUTE
+    - Enables delivery confirmation UI
+    """
+
+    order = ORDERS_DB.get(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order["status"] != "en_route":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Arrival not valid in state: {order['status']}",
+        )
+
+    order["arrival_detected_at"] = now_ts()
+
+    return {
+        "order_id": order_id,
+        "arrival_time": order["arrival_detected_at"],
+        "message": "Arrived at destination 📍",
+    }
+
+
+# ============================================================
+# 7D) COMPLETE DELIVERY (PROOF ENFORCED)
+# ============================================================
+
+class CompleteDeliveryRequest(BaseModel):
+    """
+    Delivery completion payload.
+
+    RULES:
+    - leave_at_door → delivery_photo_url REQUIRED
+    - hand_to_customer → handed_to_customer MUST be TRUE
+    """
+    delivery_photo_url: Optional[str] = None
+    handed_to_customer: Optional[bool] = None
+
+
+@app.post("/orders/{order_id}/complete")
+def complete_delivery(order_id: str, payload: CompleteDeliveryRequest):
+    """
+    Completes delivery and releases driver.
+
+    RULES:
+    - Order must be EN_ROUTE
+    - Arrival must be detected first
+    - Proof rules enforced based on delivery type
+    """
+
+    order = ORDERS_DB.get(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order["status"] != "en_route":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot complete delivery from state: {order['status']}",
+        )
+
+    if not order.get("arrival_detected_at"):
+        raise HTTPException(
+            status_code=400,
+            detail="Arrival must be detected before completing delivery",
+        )
+
+    # ---- Default delivery type ----
+    delivery_type = order.get("delivery_type", "hand_to_customer")
+
+    # ========================================================
+    # LEAVE AT DOOR → PHOTO REQUIRED
+    # ========================================================
+    if delivery_type == "leave_at_door":
+        if not payload.delivery_photo_url:
+            raise HTTPException(
+                status_code=400,
+                detail="Delivery photo required for leave-at-door orders",
+            )
+        order["delivery_photo_url"] = payload.delivery_photo_url
+
+    # ========================================================
+    # HAND TO CUSTOMER → CONFIRMATION REQUIRED
+    # ========================================================
+    if delivery_type == "hand_to_customer":
+        if payload.handed_to_customer is not True:
+            raise HTTPException(
+                status_code=400,
+                detail="Driver must confirm handoff to customer",
+            )
+
+    # ========================================================
+    # FINALIZE DELIVERY
+    # ========================================================
+
+    order["delivered_at"] = now_ts()
+    safe_transition(order, "delivered")
+
+    # ---- Release driver ----
+    driver = DRIVERS_DB.get(order["driver_id"])
+    if driver:
+        driver["current_order_id"] = None
+        driver["is_available"] = True
+        driver.setdefault("status_timestamps", {})
+        driver["status_timestamps"]["available"] = now_ts()
+
+    # ---- Delivery duration ----
+    delivery_duration = (
+        order["delivered_at"]
+        - order.get("delivery_started_at", order["delivered_at"])
+    )
+
+    return {
+        "order_id": order_id,
+        "status": order["status"],
+        "delivery_time_seconds": delivery_duration,
+        "message": "Delivery complete 🎉 Thank you for your great work!",
         "payouts_finalized": {
             "driver_payout": order["driver_payout_locked"],
             "platform_payout": order["platform_payout_locked"],
         },
     }
+
 
 
 # ============================================================
