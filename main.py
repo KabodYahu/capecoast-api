@@ -546,6 +546,89 @@ def assign_driver(
 
 
 # ============================================================
+# 6B) DRIVER: Live GPS tracking (order-level)
+# ============================================================
+
+@app.post("/orders/{order_id}/location")
+def driver_location_ping(order_id: str, payload: DriverLocationPing):
+    """
+    Driver posts location updates while working an order.
+
+    RULES:
+    - Order must exist
+    - Order must have a driver assigned
+    - Order must be in assigned / picked_up / en_route
+    - If driver_id is provided, it must match the assigned driver
+    """
+
+    # ---- Lookup order ----
+    order = ORDERS_DB.get(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    # ---- Validate assigned driver exists on the order ----
+    assigned_driver_id = order.get("driver_id")
+    if not assigned_driver_id:
+        raise HTTPException(status_code=400, detail="Order has no assigned driver")
+
+    # ---- Validate order status for tracking ----
+    if order["status"] not in ["assigned", "picked_up", "en_route"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Location updates not allowed in state: {order['status']}",
+        )
+
+    # ---- Optional driver_id verification ----
+    if payload.driver_id and payload.driver_id.strip() != assigned_driver_id:
+        raise HTTPException(status_code=403, detail="Driver mismatch for this order")
+
+    # ---- Store last known location ----
+    order["driver_last_location"] = {
+        "lat": payload.lat,
+        "lng": payload.lng,
+        "accuracy_meters": payload.accuracy_meters,
+        "ts": now_ts(),
+    }
+
+    # ---- Store small rolling history (prevents memory bloat on Cloud Run) ----
+    order.setdefault("driver_location_history", [])
+    order["driver_location_history"].append(order["driver_last_location"])
+
+    # Keep only last 50 pings
+    if len(order["driver_location_history"]) > 50:
+        order["driver_location_history"] = order["driver_location_history"][-50:]
+
+    return {
+        "order_id": order_id,
+        "status": order["status"],
+        "driver_id": assigned_driver_id,
+        "last_location": order["driver_last_location"],
+        "history_count": len(order["driver_location_history"]),
+    }
+
+
+
+# ----------------------------
+# Driver location ping model
+# ----------------------------
+
+class DriverLocationPing(BaseModel):
+    """
+    Driver sends periodic GPS updates while on an active order.
+
+    You can send:
+    - driver_id (optional now, recommended later for extra validation)
+    - latitude / longitude
+    - accuracy_meters (optional)
+    """
+    driver_id: Optional[str] = None
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    accuracy_meters: Optional[float] = Field(default=None, ge=0)
+
+
+
+# ============================================================
 # 7A) DRIVER CONFIRMS PICKUP (PHOTO REQUIRED)
 # ============================================================
 
