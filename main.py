@@ -178,6 +178,26 @@ class AssignDriverRequest(BaseModel):
     driver_id: Optional[str] = None
 
 
+# ----------------------------
+# Driver location ping model
+# ----------------------------
+
+class DriverLocationPing(BaseModel):
+    """
+    Driver sends periodic GPS updates while on an active order.
+
+    You can send:
+    - driver_id (optional now, recommended later for extra validation)
+    - latitude / longitude
+    - accuracy_meters (optional)
+    """
+    driver_id: Optional[str] = None
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    accuracy_meters: Optional[float] = Field(default=None, ge=0)
+
+
+
 # ============================================================
 # Helper Functions (keep logic out of endpoints)
 # ============================================================
@@ -608,26 +628,6 @@ def driver_location_ping(order_id: str, payload: DriverLocationPing):
 
 
 
-# ----------------------------
-# Driver location ping model
-# ----------------------------
-
-class DriverLocationPing(BaseModel):
-    """
-    Driver sends periodic GPS updates while on an active order.
-
-    You can send:
-    - driver_id (optional now, recommended later for extra validation)
-    - latitude / longitude
-    - accuracy_meters (optional)
-    """
-    driver_id: Optional[str] = None
-    lat: float = Field(ge=-90, le=90)
-    lng: float = Field(ge=-180, le=180)
-    accuracy_meters: Optional[float] = Field(default=None, ge=0)
-
-
-
 # ============================================================
 # 7A) DRIVER CONFIRMS PICKUP (PHOTO REQUIRED)
 # ============================================================
@@ -761,7 +761,7 @@ class CompleteDeliveryRequest(BaseModel):
     handed_to_customer: Optional[bool] = None
 
 
-@app.post("/orders/{order_id}/complete")
+@app.post("/orders/{order_id}/complete-delivery")
 def complete_delivery(order_id: str, payload: CompleteDeliveryRequest):
     """
     Completes delivery and releases driver.
