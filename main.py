@@ -8,18 +8,12 @@
 # - On Cloud Run, memory resets on redeploy and may not persist across instances.
 # ============================================================
 
-
-# ============================================================
-# Imports
-# ============================================================
-
 from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel, Field
 from typing import Dict, Optional, List
 from uuid import uuid4
 import time
 import os
-
 
 # ============================================================
 # App Initialization
@@ -28,25 +22,16 @@ import os
 app = FastAPI(
     title="Cape Coast Delivery API",
     description="Local-first food & grocery delivery platform",
-    version="0.2.0",
+    version="0.2.1",
 )
-
 
 # ============================================================
 # Temporary In-Memory Databases
 # (Later: Firestore / Postgres)
 # ============================================================
 
-# Orders:
-#   Key   -> order_id
-#   Value -> full order record (dict)
 ORDERS_DB: Dict[str, dict] = {}
-
-# Drivers:
-#   Key   -> driver_id
-#   Value -> full driver record (dict)
 DRIVERS_DB: Dict[str, dict] = {}
-
 
 # ============================================================
 # Economic / Pricing Logic
@@ -62,29 +47,22 @@ def calculate_quote(food_subtotal: float, platform_fee: float, delivery_fee: flo
     - Platform + Driver split margin pool (platform_fee + delivery_fee)
     - Platform: 60%
     - Driver:   40%
-
-    This function MUST be reused everywhere.
     """
 
-    # ---- Fee pool (platform + delivery) ----
     margin_pool = platform_fee + delivery_fee
-
-    # ---- Split of the margin pool ----
     platform_net = round(margin_pool * 0.60, 2)
     driver_base = round(margin_pool * 0.40, 2)
-
-    # ---- What the customer pays ----
     customer_total = round(food_subtotal + margin_pool, 2)
 
     return {
-        "food_subtotal": food_subtotal,
+        "food_subtotal": round(food_subtotal, 2),
         "fees": {
-            "platform_fee": platform_fee,
-            "delivery_fee": delivery_fee,
+            "platform_fee": round(platform_fee, 2),
+            "delivery_fee": round(delivery_fee, 2),
         },
-        "margin_pool": margin_pool,
+        "margin_pool": round(margin_pool, 2),
         "payouts": {
-            "restaurant": food_subtotal,
+            "restaurant": round(food_subtotal, 2),
             "platform_net": platform_net,
             "driver_base": driver_base,
         },
@@ -92,24 +70,19 @@ def calculate_quote(food_subtotal: float, platform_fee: float, delivery_fee: flo
         "valid": True,
     }
 
-
 # ============================================================
 # Order Lifecycle Rules (BUSINESS LAW)
 # ============================================================
 
-# Centralized state machine:
-# - Prevents illegal jumps (pending -> delivered)
-# - Keeps behavior consistent across the entire platform
 ALLOWED_TRANSITIONS = {
     "pending": ["confirmed", "cancelled"],
     "confirmed": ["assigned", "cancelled"],
-    "assigned": ["picked_up", "cancelled"],  # optional policy choice
+    "assigned": ["picked_up", "cancelled"],
     "picked_up": ["en_route"],
     "en_route": ["delivered"],
     "delivered": [],
     "cancelled": [],
 }
-
 
 # ============================================================
 # Request / Response Models
@@ -120,14 +93,8 @@ class OrderQuoteRequest(BaseModel):
     platform_fee: float = Field(ge=0)
     delivery_fee: float = Field(ge=0)
 
-
 class CreateOrderRequest(OrderQuoteRequest):
-    """
-    Extends quote request.
-    Locks restaurant identity into the order.
-    """
     restaurant_id: str = Field(min_length=1)
-
 
 class OrderResponse(BaseModel):
     order_id: str
@@ -136,26 +103,16 @@ class OrderResponse(BaseModel):
     quote: dict
     created_at: int
 
-
 class OrderStatusUpdate(BaseModel):
-    """
-    Generic status update model.
-    """
     new_status: str = Field(min_length=1)
-
 
 # ----------------------------
 # Driver models
 # ----------------------------
 
 class RegisterDriverRequest(BaseModel):
-    """
-    Driver registration (temporary / basic).
-    Later: add KYC, vehicle type, license, etc.
-    """
     name: str = Field(min_length=1)
     phone: str = Field(min_length=6)
-
 
 class DriverResponse(BaseModel):
     driver_id: str
@@ -165,53 +122,31 @@ class DriverResponse(BaseModel):
     current_order_id: Optional[str] = None
     created_at: int
 
-
 class SetDriverAvailabilityRequest(BaseModel):
     is_available: bool
 
-
 class AssignDriverRequest(BaseModel):
-    """
-    If driver_id is omitted (or null), the system auto-selects
-    the first available driver (simple MVP).
-    """
     driver_id: Optional[str] = None
-
 
 # ----------------------------
 # Driver location ping model
 # ----------------------------
 
 class DriverLocationPing(BaseModel):
-    """
-    Driver sends periodic GPS updates while on an active order.
-
-    You can send:
-    - driver_id (optional now, recommended later for extra validation)
-    - latitude / longitude
-    - accuracy_meters (optional)
-    """
     driver_id: Optional[str] = None
     lat: float = Field(ge=-90, le=90)
     lng: float = Field(ge=-180, le=180)
     accuracy_meters: Optional[float] = Field(default=None, ge=0)
-
-
 
 # ============================================================
 # Helper Functions (keep logic out of endpoints)
 # ============================================================
 
 def now_ts() -> int:
-    """Unix timestamp helper (seconds)."""
     return int(time.time())
 
-
 def safe_transition(order: dict, requested_status: str) -> None:
-    """
-    Enforces the state machine.
-    Mutates the order safely (in place).
-    """
+    requested_status = requested_status.strip()
     current_status = order["status"]
     allowed = ALLOWED_TRANSITIONS.get(current_status, [])
 
@@ -221,26 +156,24 @@ def safe_transition(order: dict, requested_status: str) -> None:
             detail=f"Invalid transition: {current_status} -> {requested_status}",
         )
 
-    # ---- State change ----
     order["status"] = requested_status
-
-    # ---- Timestamp tracking ----
     order.setdefault("status_timestamps", {})
     order["status_timestamps"][requested_status] = now_ts()
 
-
 def pick_available_driver() -> dict:
-    """
-    Simple MVP driver matching:
-    - Pick the first available driver in DRIVERS_DB.
-    Later: distance, ratings, fairness rotation, vehicle type, etc.
-    """
     for d in DRIVERS_DB.values():
         if d.get("is_available") is True and d.get("current_order_id") is None:
             return d
-
     raise HTTPException(status_code=409, detail="No available drivers right now")
 
+def assert_driver_authorized(order: dict, driver_id: str) -> None:
+    assigned_driver_id = order.get("driver_id")
+
+    if not assigned_driver_id:
+        raise HTTPException(status_code=400, detail="No driver assigned to this order")
+
+    if driver_id != assigned_driver_id:
+        raise HTTPException(status_code=403, detail="Driver not authorized for this order")
 
 # ============================================================
 # Health Check
@@ -248,9 +181,7 @@ def pick_available_driver() -> dict:
 
 @app.get("/")
 def root():
-    """Service health check"""
     return {"message": "Cape Coast API running", "ts": now_ts()}
-
 
 # ============================================================
 # 1) Quote Order (NO STORAGE)
@@ -258,19 +189,11 @@ def root():
 
 @app.post("/orders/quote")
 def quote_order(payload: OrderQuoteRequest):
-    """
-    Returns pricing ONLY.
-    No order is created.
-    Used for checkout previews.
-    """
-
-    # ---- Compute quote (no persistence) ----
     return calculate_quote(
         payload.food_subtotal,
         payload.platform_fee,
         payload.delivery_fee,
     )
-
 
 # ============================================================
 # 2) Create Order (PERSIST)
@@ -278,48 +201,35 @@ def quote_order(payload: OrderQuoteRequest):
 
 @app.post("/orders", response_model=OrderResponse)
 def create_order(payload: CreateOrderRequest):
-    """
-    Creates a pending order.
-    Economics are calculated but NOT yet finalized (payment not confirmed).
-    """
-
     restaurant_id = payload.restaurant_id.strip()
     if not restaurant_id:
         raise HTTPException(status_code=400, detail="restaurant_id cannot be empty")
 
-    # ---- Compute quote at creation time ----
     quote = calculate_quote(
         payload.food_subtotal,
         payload.platform_fee,
         payload.delivery_fee,
     )
 
-    # ---- Generate identifiers / timestamps ----
     order_id = f"ORD-{uuid4().hex[:10].upper()}"
     timestamp = now_ts()
 
-    # ---- Create order record ----
     order_record = {
         "order_id": order_id,
         "restaurant_id": restaurant_id,
         "status": "pending",
         "quote": quote,
         "created_at": timestamp,
-
-        # ---- Status timestamps start here ----
         "status_timestamps": {"pending": timestamp},
-
-        # ---- Driver assignment fields (filled later) ----
         "driver_id": None,
         "driver_payout_locked": None,
         "platform_payout_locked": None,
+        # Default delivery type for MVP
+        "delivery_type": "hand_to_customer",
     }
 
-    # ---- Persist in memory ----
     ORDERS_DB[order_id] = order_record
-
     return order_record
-
 
 # ============================================================
 # 3) Retrieve Order
@@ -327,19 +237,10 @@ def create_order(payload: CreateOrderRequest):
 
 @app.get("/orders/{order_id}")
 def get_order(order_id: str):
-    """
-    Fetch a persisted order.
-    Used by customers, drivers, admins.
-    """
-
-    # ---- Lookup ----
     order = ORDERS_DB.get(order_id)
-
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-
     return order
-
 
 # ============================================================
 # 4) Confirm Order (PAYMENT LOCK-IN)
@@ -347,21 +248,10 @@ def get_order(order_id: str):
 
 @app.post("/orders/{order_id}/confirm")
 def confirm_order(order_id: str):
-    """
-    Confirms an order AFTER successful payment.
-
-    Rules:
-    - Only PENDING orders can be confirmed
-    - Makes order eligible for driver assignment
-    """
-
-    # ---- Lookup ----
     order = ORDERS_DB.get(order_id)
-
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # ---- Enforce transition via the state machine ----
     safe_transition(order, "confirmed")
 
     return {
@@ -371,26 +261,17 @@ def confirm_order(order_id: str):
         "quote": order["quote"],
     }
 
-
 # ============================================================
 # 5) Generic Status Transition (admin/system use)
 # ============================================================
 
 @app.patch("/orders/{order_id}/status")
 def update_order_status(order_id: str, payload: OrderStatusUpdate):
-    """
-    Safely moves an order through its lifecycle.
-    Prevents illegal jumps (e.g. pending -> delivered).
-    """
-
-    # ---- Lookup ----
     order = ORDERS_DB.get(order_id)
-
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # ---- Transition ----
-    safe_transition(order, payload.new_status.strip())
+    safe_transition(order, payload.new_status)
 
     return {
         "order_id": order_id,
@@ -398,17 +279,12 @@ def update_order_status(order_id: str, payload: OrderStatusUpdate):
         "status_timestamps": order.get("status_timestamps", {}),
     }
 
-
 # ============================================================
 # 6) DRIVER: Register, List, Availability, Assign
 # ============================================================
 
 @app.post("/drivers/register", response_model=DriverResponse)
 def register_driver(payload: RegisterDriverRequest):
-    """
-    Create a driver in our system.
-    """
-
     name = payload.name.strip()
     phone = payload.phone.strip()
 
@@ -417,7 +293,6 @@ def register_driver(payload: RegisterDriverRequest):
     if not phone:
         raise HTTPException(status_code=400, detail="phone cannot be empty")
 
-    # ---- Create driver id + record ----
     driver_id = f"DRV-{uuid4().hex[:10].upper()}"
 
     record = {
@@ -427,85 +302,53 @@ def register_driver(payload: RegisterDriverRequest):
         "is_available": True,
         "current_order_id": None,
         "created_at": now_ts(),
+        "status_timestamps": {"created": now_ts()},
     }
 
-    # ---- Persist in memory ----
     DRIVERS_DB[driver_id] = record
-
     return record
-
 
 @app.get("/drivers", response_model=List[DriverResponse])
 def list_drivers():
-    """
-    List drivers (admin/testing).
-    """
     return list(DRIVERS_DB.values())
-
 
 @app.patch("/drivers/{driver_id}/availability", response_model=DriverResponse)
 def set_driver_availability(driver_id: str, payload: SetDriverAvailabilityRequest):
-    """
-    Driver toggles availability.
-
-    Rule:
-    - You cannot set available=True if currently on an order.
-    """
-
-    # ---- Lookup ----
     driver = DRIVERS_DB.get(driver_id)
-
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
 
-    # ---- Policy enforcement ----
     if payload.is_available is True and driver.get("current_order_id"):
         raise HTTPException(
             status_code=400,
             detail="Driver is on an active order and cannot be set to available",
         )
 
-    # ---- Apply change ----
     driver["is_available"] = payload.is_available
-
+    driver.setdefault("status_timestamps", {})
+    driver["status_timestamps"]["availability_changed"] = now_ts()
     return driver
-
 
 @app.post("/orders/{order_id}/assign-driver")
 def assign_driver(
     order_id: str,
     payload: Optional[AssignDriverRequest] = Body(default=None),
 ):
-    """
-    Assign a driver to a CONFIRMED order.
-
-    Request body options:
-    - (no body) or {}           => auto-assign first available driver
-    - {"driver_id": "DRV-..."}  => manually assign that driver
-    """
-
-    # ---- Lookup order ----
     order = ORDERS_DB.get(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # ---- Must be confirmed before assignment ----
     if order["status"] != "confirmed":
         raise HTTPException(
             status_code=400,
             detail=f"Order must be confirmed before assignment. Current: {order['status']}",
         )
 
-    # ---- Prevent double assignment ----
     if order.get("driver_id"):
         raise HTTPException(status_code=409, detail="Order already has a driver assigned")
 
-    # ============================================================
-    # Driver Selection (manual or auto)
-    # ============================================================
-
+    # Driver selection: manual or auto
     if payload and payload.driver_id:
-        # ---- Manual assignment path ----
         chosen_driver_id = payload.driver_id.strip()
         if not chosen_driver_id:
             raise HTTPException(status_code=400, detail="driver_id cannot be empty")
@@ -514,18 +357,12 @@ def assign_driver(
         if not driver:
             raise HTTPException(status_code=404, detail="Driver not found")
 
-        # ---- Availability checks ----
         if driver.get("is_available") is not True or driver.get("current_order_id") is not None:
             raise HTTPException(status_code=409, detail="Driver is not available")
-
     else:
-        # ---- Auto assignment path ----
         driver = pick_available_driver()
 
-    # ============================================================
-    # Lock Payouts (prevents later manipulation)
-    # ============================================================
-
+    # Lock payouts
     driver_payout = order["quote"]["payouts"]["driver_base"]
     platform_payout = order["quote"]["payouts"]["platform_net"]
 
@@ -533,19 +370,11 @@ def assign_driver(
     order["driver_payout_locked"] = driver_payout
     order["platform_payout_locked"] = platform_payout
 
-    # ============================================================
-    # Transition Order -> assigned
-    # ============================================================
-
     safe_transition(order, "assigned")
 
-    # ============================================================
-    # Update Driver State (driver now busy)
-    # ============================================================
-
+    # Update driver state
     driver["is_available"] = False
     driver["current_order_id"] = order_id
-
     driver.setdefault("status_timestamps", {})
     driver["status_timestamps"]["assigned"] = now_ts()
 
@@ -564,45 +393,29 @@ def assign_driver(
         "status_timestamps": order.get("status_timestamps", {}),
     }
 
-
 # ============================================================
 # 6B) DRIVER: Live GPS tracking (order-level)
 # ============================================================
 
 @app.post("/orders/{order_id}/location")
 def driver_location_ping(order_id: str, payload: DriverLocationPing):
-    """
-    Driver posts location updates while working an order.
-
-    RULES:
-    - Order must exist
-    - Order must have a driver assigned
-    - Order must be in assigned / picked_up / en_route
-    - If driver_id is provided, it must match the assigned driver
-    """
-
-    # ---- Lookup order ----
     order = ORDERS_DB.get(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # ---- Validate assigned driver exists on the order ----
     assigned_driver_id = order.get("driver_id")
     if not assigned_driver_id:
         raise HTTPException(status_code=400, detail="Order has no assigned driver")
 
-    # ---- Validate order status for tracking ----
     if order["status"] not in ["assigned", "picked_up", "en_route"]:
         raise HTTPException(
             status_code=400,
             detail=f"Location updates not allowed in state: {order['status']}",
         )
 
-    # ---- Optional driver_id verification ----
     if payload.driver_id and payload.driver_id.strip() != assigned_driver_id:
         raise HTTPException(status_code=403, detail="Driver mismatch for this order")
 
-    # ---- Store last known location ----
     order["driver_last_location"] = {
         "lat": payload.lat,
         "lng": payload.lng,
@@ -610,11 +423,9 @@ def driver_location_ping(order_id: str, payload: DriverLocationPing):
         "ts": now_ts(),
     }
 
-    # ---- Store small rolling history (prevents memory bloat on Cloud Run) ----
     order.setdefault("driver_location_history", [])
     order["driver_location_history"].append(order["driver_last_location"])
 
-    # Keep only last 50 pings
     if len(order["driver_location_history"]) > 50:
         order["driver_location_history"] = order["driver_location_history"][-50:]
 
@@ -626,30 +437,18 @@ def driver_location_ping(order_id: str, payload: DriverLocationPing):
         "history_count": len(order["driver_location_history"]),
     }
 
-
-
 # ============================================================
-# 7A) DRIVER CONFIRMS PICKUP (PHOTO REQUIRED)
+# 7) DRIVER DELIVERY FLOW (AUTHORIZED)
 # ============================================================
 
-class PickupRequest(BaseModel):
-    """
-    Driver must upload a photo of the picked-up items.
-    Pickup CANNOT be confirmed without this.
-    """
+class DriverActionRequest(BaseModel):
+    driver_id: str = Field(min_length=5)
+
+class PickupRequest(DriverActionRequest):
     pickup_photo_url: str = Field(min_length=10)
-
 
 @app.post("/orders/{order_id}/pickup")
 def confirm_pickup(order_id: str, payload: PickupRequest):
-    """
-    Driver confirms pickup at restaurant/store.
-
-    RULES:
-    - Order must be ASSIGNED
-    - Pickup photo is mandatory
-    """
-
     order = ORDERS_DB.get(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -660,11 +459,10 @@ def confirm_pickup(order_id: str, payload: PickupRequest):
             detail=f"Pickup not allowed in state: {order['status']}",
         )
 
-    # ---- Record pickup proof ----
+    assert_driver_authorized(order, payload.driver_id)
+
     order["pickup_photo_url"] = payload.pickup_photo_url
     order["pickup_confirmed_at"] = now_ts()
-
-    # ---- Transition lifecycle ----
     safe_transition(order, "picked_up")
 
     return {
@@ -674,22 +472,8 @@ def confirm_pickup(order_id: str, payload: PickupRequest):
         "message": "Pickup confirmed. Great work 🚀",
     }
 
-
-# ============================================================
-# 7B) START DELIVERY (BEGIN TIMER + GPS)
-# ============================================================
-
 @app.post("/orders/{order_id}/start-delivery")
-def start_delivery(order_id: str):
-    """
-    Driver begins delivery after pickup.
-
-    RULES:
-    - Order must be PICKED_UP
-    - Starts delivery timer
-    - Enables GPS routing on frontend
-    """
-
+def start_delivery(order_id: str, payload: DriverActionRequest):
     order = ORDERS_DB.get(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -700,8 +484,9 @@ def start_delivery(order_id: str):
             detail=f"Cannot start delivery from state: {order['status']}",
         )
 
-    order["delivery_started_at"] = now_ts()
+    assert_driver_authorized(order, payload.driver_id)
 
+    order["delivery_started_at"] = now_ts()
     safe_transition(order, "en_route")
 
     return {
@@ -711,21 +496,8 @@ def start_delivery(order_id: str):
         "message": "Delivery started. Drive safe 🛣️",
     }
 
-
-# ============================================================
-# 7C) ARRIVAL DETECTED (GPS / SYSTEM EVENT)
-# ============================================================
-
 @app.post("/orders/{order_id}/arrived")
 def mark_arrival(order_id: str):
-    """
-    System marks arrival at destination based on GPS proximity.
-
-    RULES:
-    - Order must be EN_ROUTE
-    - Enables delivery confirmation UI
-    """
-
     order = ORDERS_DB.get(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -744,34 +516,12 @@ def mark_arrival(order_id: str):
         "message": "Arrived at destination 📍",
     }
 
-
-# ============================================================
-# 7D) COMPLETE DELIVERY (PROOF ENFORCED)
-# ============================================================
-
-class CompleteDeliveryRequest(BaseModel):
-    """
-    Delivery completion payload.
-
-    RULES:
-    - leave_at_door → delivery_photo_url REQUIRED
-    - hand_to_customer → handed_to_customer MUST be TRUE
-    """
+class CompleteDeliveryRequest(DriverActionRequest):
     delivery_photo_url: Optional[str] = None
     handed_to_customer: Optional[bool] = None
 
-
 @app.post("/orders/{order_id}/complete-delivery")
 def complete_delivery(order_id: str, payload: CompleteDeliveryRequest):
-    """
-    Completes delivery and releases driver.
-
-    RULES:
-    - Order must be EN_ROUTE
-    - Arrival must be detected first
-    - Proof rules enforced based on delivery type
-    """
-
     order = ORDERS_DB.get(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -788,12 +538,10 @@ def complete_delivery(order_id: str, payload: CompleteDeliveryRequest):
             detail="Arrival must be detected before completing delivery",
         )
 
-    # ---- Default delivery type ----
+    assert_driver_authorized(order, payload.driver_id)
+
     delivery_type = order.get("delivery_type", "hand_to_customer")
 
-    # ========================================================
-    # LEAVE AT DOOR → PHOTO REQUIRED
-    # ========================================================
     if delivery_type == "leave_at_door":
         if not payload.delivery_photo_url:
             raise HTTPException(
@@ -802,9 +550,6 @@ def complete_delivery(order_id: str, payload: CompleteDeliveryRequest):
             )
         order["delivery_photo_url"] = payload.delivery_photo_url
 
-    # ========================================================
-    # HAND TO CUSTOMER → CONFIRMATION REQUIRED
-    # ========================================================
     if delivery_type == "hand_to_customer":
         if payload.handed_to_customer is not True:
             raise HTTPException(
@@ -812,14 +557,10 @@ def complete_delivery(order_id: str, payload: CompleteDeliveryRequest):
                 detail="Driver must confirm handoff to customer",
             )
 
-    # ========================================================
-    # FINALIZE DELIVERY
-    # ========================================================
-
     order["delivered_at"] = now_ts()
     safe_transition(order, "delivered")
 
-    # ---- Release driver ----
+    # Release driver
     driver = DRIVERS_DB.get(order["driver_id"])
     if driver:
         driver["current_order_id"] = None
@@ -827,11 +568,7 @@ def complete_delivery(order_id: str, payload: CompleteDeliveryRequest):
         driver.setdefault("status_timestamps", {})
         driver["status_timestamps"]["available"] = now_ts()
 
-    # ---- Delivery duration ----
-    delivery_duration = (
-        order["delivered_at"]
-        - order.get("delivery_started_at", order["delivered_at"])
-    )
+    delivery_duration = order["delivered_at"] - order.get("delivery_started_at", order["delivered_at"])
 
     return {
         "order_id": order_id,
@@ -843,8 +580,6 @@ def complete_delivery(order_id: str, payload: CompleteDeliveryRequest):
             "platform_payout": order["platform_payout_locked"],
         },
     }
-
-
 
 # ============================================================
 # Cloud Run Entrypoint
