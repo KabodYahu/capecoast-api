@@ -1,10 +1,11 @@
-```python
 # ============================================================
 # Cape Coast Delivery API (MVP)
 # - Orders: quote, create, confirm, status transitions
 # - Drivers: register, list, set availability, assign to confirmed orders
-# NOTE: Uses in-memory dicts for storage (ORDERS_DB / DRIVERS_DB).
-#       On Cloud Run, memory resets on redeploy and may not persist across instances.
+#
+# NOTE:
+# - Uses in-memory dicts for storage (ORDERS_DB / DRIVERS_DB).
+# - On Cloud Run, memory resets on redeploy and may not persist across instances.
 # ============================================================
 
 
@@ -27,7 +28,7 @@ import os
 app = FastAPI(
     title="Cape Coast Delivery API",
     description="Local-first food & grocery delivery platform",
-    version="0.2.0"
+    version="0.2.0",
 )
 
 
@@ -37,13 +38,13 @@ app = FastAPI(
 # ============================================================
 
 # Orders:
-#   Key   → order_id
-#   Value → full order record (dict)
+#   Key   -> order_id
+#   Value -> full order record (dict)
 ORDERS_DB: Dict[str, dict] = {}
 
 # Drivers:
-#   Key   → driver_id
-#   Value → full driver record (dict)
+#   Key   -> driver_id
+#   Value -> full driver record (dict)
 DRIVERS_DB: Dict[str, dict] = {}
 
 
@@ -125,7 +126,7 @@ class CreateOrderRequest(OrderQuoteRequest):
     Extends quote request.
     Locks restaurant identity into the order.
     """
-    restaurant_id: str
+    restaurant_id: str = Field(min_length=1)
 
 
 class OrderResponse(BaseModel):
@@ -140,7 +141,7 @@ class OrderStatusUpdate(BaseModel):
     """
     Generic status update model.
     """
-    new_status: str
+    new_status: str = Field(min_length=1)
 
 
 # ----------------------------
@@ -197,7 +198,7 @@ def safe_transition(order: dict, requested_status: str) -> None:
     if requested_status not in allowed:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid transition: {current_status} → {requested_status}",
+            detail=f"Invalid transition: {current_status} -> {requested_status}",
         )
 
     # ---- State change ----
@@ -262,6 +263,10 @@ def create_order(payload: CreateOrderRequest):
     Economics are calculated but NOT yet finalized (payment not confirmed).
     """
 
+    restaurant_id = payload.restaurant_id.strip()
+    if not restaurant_id:
+        raise HTTPException(status_code=400, detail="restaurant_id cannot be empty")
+
     # ---- Compute quote at creation time ----
     quote = calculate_quote(
         payload.food_subtotal,
@@ -276,10 +281,13 @@ def create_order(payload: CreateOrderRequest):
     # ---- Create order record ----
     order_record = {
         "order_id": order_id,
-        "restaurant_id": payload.restaurant_id,
+        "restaurant_id": restaurant_id,
         "status": "pending",
         "quote": quote,
         "created_at": timestamp,
+
+        # ---- Status timestamps start here ----
+        "status_timestamps": {"pending": timestamp},
 
         # ---- Driver assignment fields (filled later) ----
         "driver_id": None,
@@ -324,7 +332,6 @@ def confirm_order(order_id: str):
 
     Rules:
     - Only PENDING orders can be confirmed
-    - Locks economics permanently (quote is already embedded; later you might copy/lock it)
     - Makes order eligible for driver assignment
     """
 
@@ -353,7 +360,7 @@ def confirm_order(order_id: str):
 def update_order_status(order_id: str, payload: OrderStatusUpdate):
     """
     Safely moves an order through its lifecycle.
-    Prevents illegal jumps (e.g. pending → delivered).
+    Prevents illegal jumps (e.g. pending -> delivered).
     """
 
     # ---- Lookup ----
@@ -363,7 +370,7 @@ def update_order_status(order_id: str, payload: OrderStatusUpdate):
         raise HTTPException(status_code=404, detail="Order not found")
 
     # ---- Transition ----
-    safe_transition(order, payload.new_status)
+    safe_transition(order, payload.new_status.strip())
 
     return {
         "order_id": order_id,
@@ -380,19 +387,23 @@ def update_order_status(order_id: str, payload: OrderStatusUpdate):
 def register_driver(payload: RegisterDriverRequest):
     """
     Create a driver in our system.
-
-    MVP behavior:
-    - driver starts as available
-    - no KYC/identity checks (later feature)
     """
+
+    name = payload.name.strip()
+    phone = payload.phone.strip()
+
+    if not name:
+        raise HTTPException(status_code=400, detail="name cannot be empty")
+    if not phone:
+        raise HTTPException(status_code=400, detail="phone cannot be empty")
 
     # ---- Create driver id + record ----
     driver_id = f"DRV-{uuid4().hex[:10].upper()}"
 
     record = {
         "driver_id": driver_id,
-        "name": payload.name,
-        "phone": payload.phone,
+        "name": name,
+        "phone": phone,
         "is_available": True,
         "current_order_id": None,
         "created_at": now_ts(),
@@ -409,8 +420,6 @@ def list_drivers():
     """
     List drivers (admin/testing).
     """
-
-    # ---- Return all driver records ----
     return list(DRIVERS_DB.values())
 
 
@@ -433,7 +442,7 @@ def set_driver_availability(driver_id: str, payload: SetDriverAvailabilityReques
     if payload.is_available is True and driver.get("current_order_id"):
         raise HTTPException(
             status_code=400,
-            detail="Driver is on an active order and cannot told"
+            detail="Driver is on an active order and cannot be set to available",
         )
 
     # ---- Apply change ----
@@ -450,19 +459,13 @@ def assign_driver(
     """
     Assign a driver to a CONFIRMED order.
 
-    IMPORTANT:
-    - Order MUST be confirmed first (payment lock-in)
-    - Assignment locks the driver payout + platform payout
-    - Driver becomes unavailable until delivery is completed
-
     Request body options:
-    - {}                        => auto-assign first available driver
+    - (no body) or {}           => auto-assign first available driver
     - {"driver_id": "DRV-..."}  => manually assign that driver
     """
 
     # ---- Lookup order ----
     order = ORDERS_DB.get(order_id)
-
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
@@ -483,18 +486,16 @@ def assign_driver(
 
     if payload and payload.driver_id:
         # ---- Manual assignment path ----
-        driver_id = payload.driver_id.strip()
-
-        if not driver_id:
+        chosen_driver_id = payload.driver_id.strip()
+        if not chosen_driver_id:
             raise HTTPException(status_code=400, detail="driver_id cannot be empty")
 
-        driver = DRIVERS_DB.get(driver_id)
-
+        driver = DRIVERS_DB.get(chosen_driver_id)
         if not driver:
             raise HTTPException(status_code=404, detail="Driver not found")
 
         # ---- Availability checks ----
-        if not driver.get("is_available") or driver.get("current_order_id"):
+        if driver.get("is_available") is not True or driver.get("current_order_id") is not None:
             raise HTTPException(status_code=409, detail="Driver is not available")
 
     else:
@@ -549,11 +550,15 @@ def assign_driver(
 # ============================================================
 
 if __name__ == "__main__":
+    print(">>> Starting Cape Coast API <<<")
+
     import uvicorn
 
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8080)),
+        log_level="info",
+        proxy_headers=True,
+        forwarded_allow_ips="*",
     )
-```
