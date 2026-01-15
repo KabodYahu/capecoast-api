@@ -546,6 +546,96 @@ def assign_driver(
 
 
 # ============================================================
+# 7) Complete Delivery
+# ============================================================
+
+@app.post("/orders/{order_id}/complete")
+def complete_delivery(order_id: str):
+    """
+    Marks an order as delivered and releases the driver.
+
+    RULES:
+    - Order must be in 'en_route' status
+    - Order must have a driver assigned
+    - Driver is freed and becomes available again
+    - Payouts are finalized (already locked earlier)
+    """
+
+    # --------------------------------------------------------
+    # Lookup order
+    # --------------------------------------------------------
+    order = ORDERS_DB.get(order_id)
+
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    # --------------------------------------------------------
+    # Validate order state
+    # --------------------------------------------------------
+    if order["status"] != "en_route":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Order must be en_route to complete. Current: {order['status']}",
+        )
+
+    if not order.get("driver_id"):
+        raise HTTPException(
+            status_code=500,
+            detail="Order has no assigned driver (data integrity error)",
+        )
+
+    # --------------------------------------------------------
+    # Lookup driver
+    # --------------------------------------------------------
+    driver = DRIVERS_DB.get(order["driver_id"])
+
+    if not driver:
+        raise HTTPException(
+            status_code=500,
+            detail="Assigned driver record missing (data integrity error)",
+        )
+
+    if driver.get("current_order_id") != order_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Driver is not assigned to this order",
+        )
+
+    # --------------------------------------------------------
+    # Transition order → delivered
+    # --------------------------------------------------------
+    safe_transition(order, "delivered")
+
+    # --------------------------------------------------------
+    # Release driver
+    # --------------------------------------------------------
+    driver["current_order_id"] = None
+    driver["is_available"] = True
+
+    driver.setdefault("status_timestamps", {})
+    driver["status_timestamps"]["available"] = now_ts()
+
+    # --------------------------------------------------------
+    # Final response
+    # --------------------------------------------------------
+    return {
+        "order_id": order_id,
+        "status": order["status"],
+        "delivered_at": order["status_timestamps"]["delivered"],
+        "driver": {
+            "driver_id": driver["driver_id"],
+            "name": driver["name"],
+            "phone": driver["phone"],
+            "is_available": driver["is_available"],
+        },
+        "payouts_finalized": {
+            "driver_payout": order["driver_payout_locked"],
+            "platform_payout": order["platform_payout_locked"],
+        },
+    }
+
+
+# ============================================================
 # Cloud Run Entrypoint
 # ============================================================
 
