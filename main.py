@@ -1,13 +1,24 @@
+```python
+# ============================================================
+# Cape Coast Delivery API (MVP)
+# - Orders: quote, create, confirm, status transitions
+# - Drivers: register, list, set availability, assign to confirmed orders
+# NOTE: Uses in-memory dicts for storage (ORDERS_DB / DRIVERS_DB).
+#       On Cloud Run, memory resets on redeploy and may not persist across instances.
+# ============================================================
+
+
 # ============================================================
 # Imports
 # ============================================================
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel, Field
 from typing import Dict, Optional, List
 from uuid import uuid4
 import time
 import os
+
 
 # ============================================================
 # App Initialization
@@ -19,6 +30,7 @@ app = FastAPI(
     version="0.2.0"
 )
 
+
 # ============================================================
 # Temporary In-Memory Databases
 # (Later: Firestore / Postgres)
@@ -26,20 +38,21 @@ app = FastAPI(
 
 # Orders:
 #   Key   → order_id
-#   Value → full order record
+#   Value → full order record (dict)
 ORDERS_DB: Dict[str, dict] = {}
 
 # Drivers:
 #   Key   → driver_id
-#   Value → full driver record
+#   Value → full driver record (dict)
 DRIVERS_DB: Dict[str, dict] = {}
+
 
 # ============================================================
 # Economic / Pricing Logic
 # (SINGLE SOURCE OF TRUTH)
 # ============================================================
 
-def calculate_quote(food_subtotal: float, platform_fee: float, delivery_fee: float):
+def calculate_quote(food_subtotal: float, platform_fee: float, delivery_fee: float) -> dict:
     """
     Core economic engine.
 
@@ -52,28 +65,32 @@ def calculate_quote(food_subtotal: float, platform_fee: float, delivery_fee: flo
     This function MUST be reused everywhere.
     """
 
+    # ---- Fee pool (platform + delivery) ----
     margin_pool = platform_fee + delivery_fee
 
+    # ---- Split of the margin pool ----
     platform_net = round(margin_pool * 0.60, 2)
-    driver_base  = round(margin_pool * 0.40, 2)
+    driver_base = round(margin_pool * 0.40, 2)
 
+    # ---- What the customer pays ----
     customer_total = round(food_subtotal + margin_pool, 2)
 
     return {
         "food_subtotal": food_subtotal,
         "fees": {
             "platform_fee": platform_fee,
-            "delivery_fee": delivery_fee
+            "delivery_fee": delivery_fee,
         },
         "margin_pool": margin_pool,
         "payouts": {
             "restaurant": food_subtotal,
             "platform_net": platform_net,
-            "driver_base": driver_base
+            "driver_base": driver_base,
         },
         "customer_total": customer_total,
-        "valid": True
+        "valid": True,
     }
+
 
 # ============================================================
 # Order Lifecycle Rules (BUSINESS LAW)
@@ -83,14 +100,15 @@ def calculate_quote(food_subtotal: float, platform_fee: float, delivery_fee: flo
 # - Prevents illegal jumps (pending -> delivered)
 # - Keeps behavior consistent across the entire platform
 ALLOWED_TRANSITIONS = {
-    "pending":   ["confirmed", "cancelled"],
+    "pending": ["confirmed", "cancelled"],
     "confirmed": ["assigned", "cancelled"],
-    "assigned":  ["picked_up", "cancelled"],   # you can allow cancel here, depending on policy
+    "assigned": ["picked_up", "cancelled"],  # optional policy choice
     "picked_up": ["en_route"],
-    "en_route":  ["delivered"],
+    "en_route": ["delivered"],
     "delivered": [],
-    "cancelled": []
+    "cancelled": [],
 }
+
 
 # ============================================================
 # Request / Response Models
@@ -132,7 +150,7 @@ class OrderStatusUpdate(BaseModel):
 class RegisterDriverRequest(BaseModel):
     """
     Driver registration (temporary / basic).
-    Later you'll add KYC, vehicle type, license, etc.
+    Later: add KYC, vehicle type, license, etc.
     """
     name: str = Field(min_length=1)
     phone: str = Field(min_length=6)
@@ -153,7 +171,7 @@ class SetDriverAvailabilityRequest(BaseModel):
 
 class AssignDriverRequest(BaseModel):
     """
-    If driver_id is omitted, the system auto-selects
+    If driver_id is omitted (or null), the system auto-selects
     the first available driver (simple MVP).
     """
     driver_id: Optional[str] = None
@@ -164,14 +182,14 @@ class AssignDriverRequest(BaseModel):
 # ============================================================
 
 def now_ts() -> int:
-    """Unix timestamp for consistent time tracking."""
+    """Unix timestamp helper (seconds)."""
     return int(time.time())
 
 
-def safe_transition(order: dict, requested_status: str):
+def safe_transition(order: dict, requested_status: str) -> None:
     """
     Enforces the state machine.
-    Mutates the order safely.
+    Mutates the order safely (in place).
     """
     current_status = order["status"]
     allowed = ALLOWED_TRANSITIONS.get(current_status, [])
@@ -179,10 +197,13 @@ def safe_transition(order: dict, requested_status: str):
     if requested_status not in allowed:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid transition: {current_status} → {requested_status}"
+            detail=f"Invalid transition: {current_status} → {requested_status}",
         )
 
+    # ---- State change ----
     order["status"] = requested_status
+
+    # ---- Timestamp tracking ----
     order.setdefault("status_timestamps", {})
     order["status_timestamps"][requested_status] = now_ts()
 
@@ -196,6 +217,7 @@ def pick_available_driver() -> dict:
     for d in DRIVERS_DB.values():
         if d.get("is_available") is True and d.get("current_order_id") is None:
             return d
+
     raise HTTPException(status_code=409, detail="No available drivers right now")
 
 
@@ -220,10 +242,12 @@ def quote_order(payload: OrderQuoteRequest):
     No order is created.
     Used for checkout previews.
     """
+
+    # ---- Compute quote (no persistence) ----
     return calculate_quote(
         payload.food_subtotal,
         payload.platform_fee,
-        payload.delivery_fee
+        payload.delivery_fee,
     )
 
 
@@ -238,29 +262,34 @@ def create_order(payload: CreateOrderRequest):
     Economics are calculated but NOT yet finalized (payment not confirmed).
     """
 
+    # ---- Compute quote at creation time ----
     quote = calculate_quote(
         payload.food_subtotal,
         payload.platform_fee,
-        payload.delivery_fee
+        payload.delivery_fee,
     )
 
-    order_id  = f"ORD-{uuid4().hex[:10].upper()}"
+    # ---- Generate identifiers / timestamps ----
+    order_id = f"ORD-{uuid4().hex[:10].upper()}"
     timestamp = now_ts()
 
+    # ---- Create order record ----
     order_record = {
         "order_id": order_id,
         "restaurant_id": payload.restaurant_id,
-        "status": "pending",  # lifecycle starts here
+        "status": "pending",
         "quote": quote,
         "created_at": timestamp,
 
-        # driver assignment fields (filled later)
+        # ---- Driver assignment fields (filled later) ----
         "driver_id": None,
         "driver_payout_locked": None,
         "platform_payout_locked": None,
     }
 
+    # ---- Persist in memory ----
     ORDERS_DB[order_id] = order_record
+
     return order_record
 
 
@@ -275,7 +304,9 @@ def get_order(order_id: str):
     Used by customers, drivers, admins.
     """
 
+    # ---- Lookup ----
     order = ORDERS_DB.get(order_id)
+
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
@@ -293,22 +324,24 @@ def confirm_order(order_id: str):
 
     Rules:
     - Only PENDING orders can be confirmed
-    - Locks economics permanently
+    - Locks economics permanently (quote is already embedded; later you might copy/lock it)
     - Makes order eligible for driver assignment
     """
 
+    # ---- Lookup ----
     order = ORDERS_DB.get(order_id)
+
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # Enforce transition via the state machine
+    # ---- Enforce transition via the state machine ----
     safe_transition(order, "confirmed")
 
     return {
         "order_id": order_id,
         "status": order["status"],
         "confirmed_at": order["status_timestamps"]["confirmed"],
-        "quote": order["quote"]
+        "quote": order["quote"],
     }
 
 
@@ -323,16 +356,19 @@ def update_order_status(order_id: str, payload: OrderStatusUpdate):
     Prevents illegal jumps (e.g. pending → delivered).
     """
 
+    # ---- Lookup ----
     order = ORDERS_DB.get(order_id)
+
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
+    # ---- Transition ----
     safe_transition(order, payload.new_status)
 
     return {
         "order_id": order_id,
         "new_status": order["status"],
-        "status_timestamps": order.get("status_timestamps", {})
+        "status_timestamps": order.get("status_timestamps", {}),
     }
 
 
@@ -350,17 +386,21 @@ def register_driver(payload: RegisterDriverRequest):
     - no KYC/identity checks (later feature)
     """
 
+    # ---- Create driver id + record ----
     driver_id = f"DRV-{uuid4().hex[:10].upper()}"
+
     record = {
         "driver_id": driver_id,
         "name": payload.name,
         "phone": payload.phone,
         "is_available": True,
         "current_order_id": None,
-        "created_at": now_ts()
+        "created_at": now_ts(),
     }
 
+    # ---- Persist in memory ----
     DRIVERS_DB[driver_id] = record
+
     return record
 
 
@@ -369,6 +409,8 @@ def list_drivers():
     """
     List drivers (admin/testing).
     """
+
+    # ---- Return all driver records ----
     return list(DRIVERS_DB.values())
 
 
@@ -376,27 +418,34 @@ def list_drivers():
 def set_driver_availability(driver_id: str, payload: SetDriverAvailabilityRequest):
     """
     Driver toggles availability.
-    You cannot set available=True if currently on an order.
+
+    Rule:
+    - You cannot set available=True if currently on an order.
     """
 
+    # ---- Lookup ----
     driver = DRIVERS_DB.get(driver_id)
+
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
 
+    # ---- Policy enforcement ----
     if payload.is_available is True and driver.get("current_order_id"):
         raise HTTPException(
             status_code=400,
-            detail="Driver is on an active order and cannot be set to available"
+            detail="Driver is on an active order and cannot told"
         )
 
+    # ---- Apply change ----
     driver["is_available"] = payload.is_available
+
     return driver
 
 
 @app.post("/orders/{order_id}/assign-driver")
 def assign_driver(
     order_id: str,
-    payload: Optional[AssignDriverRequest] = Body(default=None)
+    payload: Optional[AssignDriverRequest] = Body(default=None),
 ):
     """
     Assign a driver to a CONFIRMED order.
@@ -405,43 +454,57 @@ def assign_driver(
     - Order MUST be confirmed first (payment lock-in)
     - Assignment locks the driver payout + platform payout
     - Driver becomes unavailable until delivery is completed
+
+    Request body options:
+    - {}                        => auto-assign first available driver
+    - {"driver_id": "DRV-..."}  => manually assign that driver
     """
 
+    # ---- Lookup order ----
     order = ORDERS_DB.get(order_id)
+
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # Must be confirmed to assign a driver
+    # ---- Must be confirmed before assignment ----
     if order["status"] != "confirmed":
         raise HTTPException(
             status_code=400,
-            detail=f"Order must be confirmed before assignment. Current: {order['status']}"
+            detail=f"Order must be confirmed before assignment. Current: {order['status']}",
         )
 
-    # Prevent reassignment
+    # ---- Prevent double assignment ----
     if order.get("driver_id"):
         raise HTTPException(status_code=409, detail="Order already has a driver assigned")
 
-    # ----------------------------
-    # Select driver (manual or auto)
-    # ----------------------------
+    # ============================================================
+    # Driver Selection (manual or auto)
+    # ============================================================
+
     if payload and payload.driver_id:
+        # ---- Manual assignment path ----
         driver_id = payload.driver_id.strip()
+
         if not driver_id:
             raise HTTPException(status_code=400, detail="driver_id cannot be empty")
 
         driver = DRIVERS_DB.get(driver_id)
+
         if not driver:
             raise HTTPException(status_code=404, detail="Driver not found")
 
+        # ---- Availability checks ----
         if not driver.get("is_available") or driver.get("current_order_id"):
             raise HTTPException(status_code=409, detail="Driver is not available")
+
     else:
+        # ---- Auto assignment path ----
         driver = pick_available_driver()
 
-    # ----------------------------
-    # Lock payouts at assignment time
-    # ----------------------------
+    # ============================================================
+    # Lock Payouts (prevents later manipulation)
+    # ============================================================
+
     driver_payout = order["quote"]["payouts"]["driver_base"]
     platform_payout = order["quote"]["payouts"]["platform_net"]
 
@@ -449,12 +512,19 @@ def assign_driver(
     order["driver_payout_locked"] = driver_payout
     order["platform_payout_locked"] = platform_payout
 
-    # Transition order to assigned
+    # ============================================================
+    # Transition Order -> assigned
+    # ============================================================
+
     safe_transition(order, "assigned")
 
-    # Update driver state
+    # ============================================================
+    # Update Driver State (driver now busy)
+    # ============================================================
+
     driver["is_available"] = False
     driver["current_order_id"] = order_id
+
     driver.setdefault("status_timestamps", {})
     driver["status_timestamps"]["assigned"] = now_ts()
 
@@ -464,15 +534,14 @@ def assign_driver(
         "driver": {
             "driver_id": driver["driver_id"],
             "name": driver["name"],
-            "phone": driver["phone"]
+            "phone": driver["phone"],
         },
         "payouts_locked": {
             "driver_payout": driver_payout,
-            "platform_payout": platform_payout
+            "platform_payout": platform_payout,
         },
-        "status_timestamps": order.get("status_timestamps", {})
+        "status_timestamps": order.get("status_timestamps", {}),
     }
-
 
 
 # ============================================================
@@ -481,8 +550,10 @@ def assign_driver(
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8080))
+        port=int(os.environ.get("PORT", 8080)),
     )
+```
